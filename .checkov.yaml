@@ -1,0 +1,47 @@
+# Excepciones de checkov ACEPTADAS para esta demo (ambiente dev, sin datos sensibles).
+# Documentar el porqué de cada excepción es parte de la buena práctica:
+# en producción, revisa esta lista y activa lo que aplique.
+framework:
+  - terraform
+  - cloudformation
+compact: true
+skip-check:
+  # --- Costo: valen la pena en producción, no en una demo ---
+  - CKV2_AWS_29 # WAF en API Gateway
+  - CKV_AWS_158 # KMS propio para log groups (US$1/mes por llave)
+  - CKV_AWS_119 # KMS propio para DynamoDB (se usa la llave administrada por AWS)
+  - CKV_AWS_145 # KMS propio para S3 (se usa SSE-S3: el contenido del sitio es público)
+  - CKV_AWS_338 # Logs por 1 año: 14 días es suficiente para dev
+  - CKV_AWS_18 # Access logs de S3
+  - CKV2_AWS_62 # Notificaciones de eventos de S3
+  - CKV_AWS_144 # Replicación entre regiones de S3
+  - CKV_AWS_120 # Caché de API Gateway (costo por hora)
+  # --- Mejoras pendientes del módulo api_gateway_deployment (recomendadas en prod) ---
+  - CKV_AWS_76 # Access logs del stage
+  - CKV2_AWS_4 # Nivel de logging del stage (method settings)
+  - CKV_AWS_73 # X-Ray en el stage
+  # --- No aplican a esta arquitectura ---
+  - CKV_AWS_117 # Lambda en VPC: solo habla con DynamoDB, no necesita VPC
+  - CKV_AWS_116 # DLQ: la invocación es síncrona desde API Gateway
+  - CKV_AWS_272 # Code signing de Lambda
+  - CKV_AWS_173 # KMS para variables de entorno: no contienen secretos
+  - CKV_AWS_50 # X-Ray en Lambda: se omite para mantener la demo simple
+  - CKV_AWS_115 # Concurrencia reservada: cuentas nuevas tienen un límite bajo
+  - CKV_AWS_59 # Autorizador en métodos: API pública de un contador
+  - CKV2_AWS_53 # Validación de request: el body no se usa
+  - CKV2_AWS_51 # Certificado de cliente: la API la consume el navegador
+  - CKV_AWS_237 # create_before_destroy en el REST API: se recrea solo con destroy
+  - CKV2_AWS_61 # Lifecycle en el bucket del frontend
+  # --- Frontend público servido desde S3 (sin CloudFront, para que la demo despliegue rápido) ---
+  - CKV_AWS_54 # block_public_policy: el sitio se expone con una política de solo lectura
+  - CKV_AWS_56 # restrict_public_buckets: ídem
+  # --- Módulo cloudfront_distribution: no se usa en la demo, pero checkov lo escanea ---
+  - CKV_AWS_68 # WAF en CloudFront (~US$5+/mes por web ACL)
+  - CKV2_AWS_47 # Regla Log4j de WAF (depende de WAF)
+  - CKV_AWS_86 # Access logs de CloudFront
+  - CKV_AWS_310 # Origin failover en CloudFront
+  - CKV_AWS_374 # Geo restriction en CloudFront
+  - CKV2_AWS_42 # Certificado SSL propio (ACM + dominio)
+  - CKV_AWS_174 # TLS 1.2 mínimo: con el certificado por defecto de CloudFront no se puede fijar
+  # omitidos intencionalmente
+  - CKV2_AWS_6 # Requerido para usar S3 con web hosting

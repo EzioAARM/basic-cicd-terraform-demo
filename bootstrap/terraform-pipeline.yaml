@@ -1,0 +1,586 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Pipeline de Terraform: Source (GitHub) -> Build (plan) -> Aprobacion manual
+  -> Deploy (apply del plan aprobado). Buildspecs: .aws/build.yaml y .aws/deploy.yaml.
+  La configuracion se lee de Parameter Store en /{macro-app}/{app}/{env}/parameters/*
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Identificacion (ruta de parametros y nombres)" }
+        Parameters: [MacroAppName, AppName, Environment]
+      - Label: { default: "Repositorio" }
+        Parameters: [ConnectionArn, FullRepositoryId, BranchName]
+      - Label: { default: "Valores iniciales de Parameter Store" }
+        Parameters: [TerraformVersion, StateBucketName, Owner]
+      - Label: { default: "Permisos y aprobacion" }
+        Parameters: [ResourcePrefix, ApprovalEmail]
+
+Parameters:
+  MacroAppName:
+    Type: String
+    Default: demo
+    AllowedPattern: "^[a-z0-9-]{2,20}$"
+    Description: Nombre de la macro aplicacion (primer nivel de la ruta).
+  AppName:
+    Type: String
+    Default: infra
+    AllowedPattern: "^[a-z0-9-]{2,20}$"
+    Description: Nombre de la aplicacion (segundo nivel de la ruta).
+  Environment:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-z0-9-]{2,10}$"
+    Description: Ambiente (tercer nivel de la ruta).
+  ConnectionArn:
+    Type: String
+    AllowedPattern: "^arn:aws:(codestar-connections|codeconnections):[a-z0-9-]+:[0-9]{12}:connection/.+$"
+    Description: ARN de la conexion a GitHub en estado AVAILABLE.
+  FullRepositoryId:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    Description: Repositorio en formato owner/repo.
+  BranchName:
+    Type: String
+    Default: main
+    Description: Rama que dispara el pipeline.
+  TerraformVersion:
+    Type: String
+    Default: "1.16.5"
+    AllowedPattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    Description: Version exacta de Terraform.
+  StateBucketName:
+    Type: String
+    Description: Bucket del state (salida BucketName del stack del backend).
+  Owner:
+    Type: String
+    Description: Valor inicial de la variable owner en el tfvars.
+  ResourcePrefix:
+    Type: String
+    Default: demo
+    AllowedPattern: "^[a-z0-9-]{3,30}$"
+    Description: >
+      Prefijo de los recursos que crea Terraform. Los permisos del pipeline
+      se limitan a recursos con este prefijo.
+  ApprovalEmail:
+    Type: String
+    Default: ""
+    Description: Correo que recibe la solicitud de aprobacion (opcional).
+
+Conditions:
+  HasApprovalEmail: !Not [!Equals [!Ref ApprovalEmail, ""]]
+
+Resources:
+  # ───────────────────────── Parameter Store ─────────────────────────
+  # CloudFormation solo define el valor inicial. Los cambios del dia a dia se
+  # hacen en Parameter Store; si actualizas el stack con otros valores, los
+  # sobrescribe.
+  BuildParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${MacroAppName}/${AppName}/${Environment}/parameters/build"
+      Description: Configuracion del pipeline de Terraform (formato KEY=VALUE)
+      Type: String
+      Value: !Sub |
+        TF_VERSION=${TerraformVersion}
+        TF_STATE_BUCKET=${StateBucketName}
+        TF_STATE_KEY=${MacroAppName}/${AppName}/${Environment}/terraform.tfstate
+
+  TfvarsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${MacroAppName}/${AppName}/${Environment}/parameters/tfvars"
+      Description: Contenido de terraform.tfvars (formato HCL)
+      Type: String
+      Value: !Sub |
+        region      = "${AWS::Region}"
+        environment = "${Environment}"
+        owner       = "${Owner}"
+
+  # ───────────────────────── Artefactos ─────────────────────────
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    # Retain: CloudFormation no puede borrar un bucket con objetos.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Bucket de artefactos temporales; expiran a los 30 dias.
+          - id: CKV_AWS_21
+            comment: Los artefactos se regeneran en cada ejecucion.
+    Properties:
+      BucketName: !Sub "${MacroAppName}-${AppName}-${Environment}-pipeline-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expirar-artefactos
+            Status: Enabled
+            ExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub "${ArtifactBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ───────────────────────── Notificacion de aprobacion ─────────────────────────
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasApprovalEmail
+    Properties:
+      TopicName: !Sub "${MacroAppName}-${AppName}-${Environment}-approval"
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref ApprovalEmail
+
+  # ───────────────────────── Logs ─────────────────────────
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${MacroAppName}-${AppName}-${Environment}-build"
+      RetentionInDays: 30
+
+  DeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${MacroAppName}-${AppName}-${Environment}-deploy"
+      RetentionInDays: 30
+
+  # ───────────────────────── IAM: permisos de Terraform ─────────────────────────
+  # Lectura: lo que necesitan build (plan) y deploy (apply) para refrescar el estado.
+  TerraformReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Lectura de parametros, state y recursos administrados por Terraform.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Todo lo que cuelgue de /{macro-app}/{app}/{env}/parameters/
+          - Sid: ParameterStore
+            Effect: Allow
+            Action: [ssm:GetParameter, ssm:GetParameters]
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${MacroAppName}/${AppName}/${Environment}/parameters/*"
+          - Sid: StateBucketList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub "arn:aws:s3:::${StateBucketName}"
+          # State y lock (use_lockfile) bajo /{macro-app}/{app}/{env}/
+          - Sid: StateReadAndLock
+            Effect: Allow
+            Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+            Resource: !Sub "arn:aws:s3:::${StateBucketName}/${MacroAppName}/${AppName}/${Environment}/*.tflock"
+          - Sid: StateRead
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${StateBucketName}/${MacroAppName}/${AppName}/${Environment}/*"
+          - Sid: S3Read
+            Effect: Allow
+            Action: [s3:Get*, s3:List*]
+            Resource:
+              - !Sub "arn:aws:s3:::${ResourcePrefix}-*"
+              - !Sub "arn:aws:s3:::${ResourcePrefix}-*/*"
+          - Sid: DynamoRead
+            Effect: Allow
+            Action: [dynamodb:Describe*, dynamodb:List*]
+            Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-*"
+          - Sid: LambdaRead
+            Effect: Allow
+            Action: [lambda:Get*, lambda:List*]
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-*"
+          - Sid: LogsDescribe
+            Effect: Allow
+            Action: logs:DescribeLogGroups
+            Resource: "*"
+          - Sid: LogsRead
+            Effect: Allow
+            Action: [logs:ListTagsForResource, logs:ListTagsLogGroup]
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-*"
+          - Sid: IamRead
+            Effect: Allow
+            Action:
+              - iam:GetRole
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:ListRoleTags
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ResourcePrefix}-*"
+          - Sid: ApiGatewayRead
+            Effect: Allow
+            Action: apigateway:GET
+            Resource:
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/*"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/tags/*"
+          # CloudFront es global y las politicas administradas se buscan por nombre.
+          - Sid: CloudFrontRead
+            Effect: Allow
+            Action: [cloudfront:Get*, cloudfront:List*]
+            Resource: "*"
+
+  # Escritura: solo para deploy (apply), limitada al prefijo de los recursos.
+  TerraformWritePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: CloudFront y API Gateway no permiten acotar por nombre; el resto va por prefijo.
+          - id: CKV_AWS_109
+            comment: La escritura de IAM esta limitada por prefijo y por PolicyARN.
+    Properties:
+      Description: Escritura de los recursos administrados por Terraform (solo deploy).
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: StateWrite
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub "arn:aws:s3:::${StateBucketName}/${MacroAppName}/${AppName}/${Environment}/*"
+          - Sid: S3Write
+            Effect: Allow
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${ResourcePrefix}-*"
+              - !Sub "arn:aws:s3:::${ResourcePrefix}-*/*"
+          - Sid: DynamoWrite
+            Effect: Allow
+            Action: "dynamodb:*"
+            Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-*"
+          - Sid: LambdaWrite
+            Effect: Allow
+            Action: "lambda:*"
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-*"
+          - Sid: LogsWrite
+            Effect: Allow
+            Action: "logs:*"
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-*:*"
+          - Sid: IamRoles
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:UpdateRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:ListInstanceProfilesForRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ResourcePrefix}-*"
+          # Solo se pueden adjuntar las politicas administradas que usa lambda_function.
+          - Sid: IamAttachLambdaPolicies
+            Effect: Allow
+            Action: [iam:AttachRolePolicy, iam:DetachRolePolicy]
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ResourcePrefix}-*"
+            Condition:
+              ArnEquals:
+                iam:PolicyARN:
+                  - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+                  - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - Sid: IamPassRoleToLambda
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ResourcePrefix}-*"
+            Condition:
+              StringEquals:
+                iam:PassedToService: lambda.amazonaws.com
+          - Sid: ApiGatewayWrite
+            Effect: Allow
+            Action:
+              [
+                apigateway:POST,
+                apigateway:PUT,
+                apigateway:PATCH,
+                apigateway:DELETE,
+              ]
+            Resource:
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/*"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/tags/*"
+          - Sid: CloudFrontWrite
+            Effect: Allow
+            Action:
+              - cloudfront:CreateDistribution
+              - cloudfront:UpdateDistribution
+              - cloudfront:DeleteDistribution
+              - cloudfront:TagResource
+              - cloudfront:UntagResource
+              - cloudfront:CreateInvalidation
+              - cloudfront:CreateOriginAccessControl
+              - cloudfront:UpdateOriginAccessControl
+              - cloudfront:DeleteOriginAccessControl
+            Resource: "*"
+
+  # ───────────────────────── IAM: CodeBuild ─────────────────────────
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MacroAppName}-${AppName}-${Environment}-build"
+      Description: CodeBuild - terraform plan (solo lectura)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Ref TerraformReadPolicy
+      Policies:
+        - PolicyName: codebuild-base
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt BuildLogGroup.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MacroAppName}-${AppName}-${Environment}-deploy"
+      Description: CodeBuild - terraform apply
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Ref TerraformReadPolicy
+        - !Ref TerraformWritePolicy
+      Policies:
+        - PolicyName: codebuild-base
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt DeployLogGroup.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+
+  # ───────────────────────── CodeBuild ─────────────────────────
+  # Unica variable de entorno: la ruta base de parametros. Todo lo demas
+  # (version de Terraform, backend, tfvars) se lee de Parameter Store.
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${MacroAppName}-${AppName}-${Environment}-build"
+      Description: terraform fmt, checkov, validate y plan
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 30
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: .aws/build.yaml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: PARAMETERS_PATH
+            Value: !Sub "/${MacroAppName}/${AppName}/${Environment}/parameters"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${MacroAppName}-${AppName}-${Environment}-deploy"
+      Description: terraform apply del plan aprobado
+      ServiceRole: !GetAtt DeployRole.Arn
+      TimeoutInMinutes: 60
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: .aws/deploy.yaml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: PARAMETERS_PATH
+            Value: !Sub "/${MacroAppName}/${AppName}/${Environment}/parameters"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref DeployLogGroup
+
+  # ───────────────────────── CodePipeline ─────────────────────────
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MacroAppName}-${AppName}-${Environment}-pipeline"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  [
+                    s3:GetObject,
+                    s3:GetObjectVersion,
+                    s3:PutObject,
+                    s3:GetBucketVersioning,
+                  ]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  [
+                    codestar-connections:UseConnection,
+                    codeconnections:UseConnection,
+                  ]
+                Resource: !Ref ConnectionArn
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt DeployProject.Arn
+              - !If
+                - HasApprovalEmail
+                - Effect: Allow
+                  Action: sns:Publish
+                  Resource: !Ref ApprovalTopic
+                - !Ref AWS::NoValue
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${MacroAppName}-${AppName}-${Environment}"
+      PipelineType: V2
+      # Las ejecuciones se procesan en orden; una nueva no reemplaza a la que
+      # espera aprobacion. Si el plan quedo desactualizado, Terraform rechaza
+      # el apply con "Saved plan is stale".
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Ref FullRepositoryId
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        - Name: Build
+          Actions:
+            - Name: TerraformPlan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+
+        - Name: Approval
+          Actions:
+            - Name: RevisarPlan
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: "1"
+              Configuration:
+                CustomData: Revisa el resultado de terraform plan en los logs de la fase Build antes de aprobar.
+                ExternalEntityLink: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codebuild/projects/${BuildProject}/history?region=${AWS::Region}"
+                NotificationArn:
+                  !If [HasApprovalEmail, !Ref ApprovalTopic, !Ref AWS::NoValue]
+
+        - Name: Deploy
+          Actions:
+            - Name: TerraformApply
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref DeployProject
+              InputArtifacts:
+                - Name: BuildOutput
+
+Outputs:
+  PipelineUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view"
+  ParametersPath:
+    Value: !Sub "/${MacroAppName}/${AppName}/${Environment}/parameters"
+  BuildParameterName:
+    Value: !Ref BuildParameter
+  TfvarsParameterName:
+    Value: !Ref TfvarsParameter
+  StateKey:
+    Description: Usa esta key tambien en tu backend local para compartir el state.
+    Value: !Sub "${MacroAppName}/${AppName}/${Environment}/terraform.tfstate"

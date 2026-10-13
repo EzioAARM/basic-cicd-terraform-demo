@@ -1,0 +1,19 @@
+# Terraform
+.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+.build/
+
+# Valores locales: pueden contener datos de tu cuenta
+*.tfvars
+tfvars.*
+!*.tfvars.example
+backend.hcl
+
+# El lock de providers SÍ se versiona: .terraform.lock.hcl
+
+# Otros
+.DS_Store

@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Backend remoto para Terraform: bucket S3 privado, cifrado y versionado.
+  El bloqueo se hace con use_lockfile (Terraform 1.10+), sin DynamoDB.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: >
+      Nombre del bucket. Déjalo vacío para usar tfstate-<cuenta>-<región>.
+  NoncurrentVersionRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: Días que se conservan las versiones anteriores del state.
+
+Conditions:
+  UseDefaultName: !Equals [!Ref BucketName, ""]
+
+Resources:
+  StateBucket:
+    Type: AWS::S3::Bucket
+    # El state es crítico: el bucket sobrevive aunque se borre el stack.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >
+              Access logging requiere otro bucket. Para auditoría, usa CloudTrail
+              data events sobre este bucket.
+    Properties:
+      BucketName: !If
+        - UseDefaultName
+        - !Sub "tfstate-${AWS::AccountId}-${AWS::Region}"
+        - !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: limpiar-versiones-anteriores
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          # use_lockfile crea y borra archivos .tflock; con versionado
+          # quedan marcadores de borrado que esta regla limpia.
+          - Id: limpiar-marcadores-de-borrado
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      Tags:
+        - Key: Project
+          Value: terraform-backend
+        - Key: ManagedBy
+          Value: cloudformation
+
+  StateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt StateBucket.Arn
+              - !Sub "${StateBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  BucketName:
+    Description: Bucket del state de Terraform
+    Value: !Ref StateBucket
+  BucketArn:
+    Description: ARN del bucket (útil para políticas IAM del pipeline)
+    Value: !GetAtt StateBucket.Arn
+  Region:
+    Description: Región del bucket
+    Value: !Ref AWS::Region
